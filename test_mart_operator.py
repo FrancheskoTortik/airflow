@@ -17,7 +17,6 @@ def mock_stage_context(template):
         table='test_table',
         lower_bound=lower,
         upper_bound=upper,
-        is_initial=False,
         report_dt_column='world',
         debug=False,
     )
@@ -44,6 +43,7 @@ def operator_factory(mocker: MockerFixture, method: MartMethod, template: str = 
     operator = MartOperator(
         task_id='test_task',
         template_dir='fake template dir',
+        params={'discreteness': 60},
         config=MartConfig(schema='test_schema', table='test_table', method=method, **config_params),
     )
     return operator
@@ -286,26 +286,26 @@ def test_get_date_bounds__empty_table__lower_bound_is_min_date(mocker: MockerFix
     data_interval_start = pendulum.DateTime(2020, 4, 20)
     min_date = pendulum.DateTime(2020, 1, 1)
     operator = operator_factory(mocker, MartMethod.INCREMENT, report_dt_column='test', min_date=min_date)
-    lower_bound, upper_bound = operator.get_date_bounds(mocker.MagicMock, True, data_interval_start, 60)
+    lower_bound, upper_bound = operator.get_date_bounds(data_interval_start, 60)
 
-    assert lower_bound == min_date
+    assert lower_bound == data_interval_start
     assert upper_bound == pendulum.DateTime(2020, 4, 20, 1)
 
-    lower_bound, upper_bound = operator.get_date_bounds(mocker.MagicMock, True, data_interval_start, 1440)
+    lower_bound, upper_bound = operator.get_date_bounds(data_interval_start, 1440)
 
-    assert lower_bound == min_date
+    assert lower_bound == data_interval_start
     assert upper_bound == pendulum.DateTime(2020, 4, 21)
 
 def test_get_date_bounds__no_dt_column__lower_bound_is_execution_date(mocker: MockerFixture):
     data_interval_start = pendulum.DateTime(2020, 4, 20)
     operator = operator_factory(mocker, MartMethod.REPLACE)
 
-    lower_bound, upper_bound = operator.get_date_bounds(mocker.MagicMock, False, data_interval_start, 60)
+    lower_bound, upper_bound = operator.get_date_bounds(data_interval_start, 60)
 
     assert lower_bound == data_interval_start
     assert upper_bound == pendulum.DateTime(2020, 4, 20, 1)
 
-    lower_bound, upper_bound = operator.get_date_bounds(mocker.MagicMock, False, data_interval_start, 1440)
+    lower_bound, upper_bound = operator.get_date_bounds(data_interval_start, 1440)
 
     assert lower_bound == data_interval_start
     assert upper_bound == pendulum.DateTime(2020, 4, 21)
@@ -324,12 +324,12 @@ def test_get_date_bounds__has_dt_column_and_lag__lower_bound_is_min_of_execution
     operator = operator_factory(mocker, MartMethod.REPLACE, report_dt_column='some_column', lag=lag)
     mocker.patch.object(operator, 'get_max_dt_column_date', return_value=max_dt_column_date)
 
-    lower_bound, upper_bound = operator.get_date_bounds(mocker.MagicMock, False, data_interval_start, 60)
+    lower_bound, upper_bound = operator.get_date_bounds(data_interval_start, 60)
 
     assert lower_bound == expected_lower_bound
     assert upper_bound == pendulum.DateTime(2020, 4, 20, 1)
 
-    lower_bound, upper_bound = operator.get_date_bounds(mocker.MagicMock, False, data_interval_start, 1440)
+    lower_bound, upper_bound = operator.get_date_bounds(data_interval_start, 1440)
 
     assert lower_bound == expected_lower_bound
     assert upper_bound == pendulum.DateTime(2020, 4, 21)
@@ -347,11 +347,17 @@ def test_execute__mock_stage_callables__stages_called_with_correct_context_and_o
         table='test_table',
         lower_bound=min_date,
         upper_bound=pendulum.DateTime(2020, 1, 1, 1),
-        is_initial=True,
         report_dt_column='test',
         debug=False,
     )
-    operator = operator_factory(mocker, MartMethod.MERGE, template=template, min_date=min_date, report_dt_column='test')
+    operator = operator_factory(
+        mocker,
+        MartMethod.MERGE,
+        template=template,
+        min_date=min_date,
+        report_dt_column='test',
+        params={'discreteness': 60},
+    )
     mocker.patch('airflow_extensions.operators.mart_operator.exasol.is_table_empty', return_value=True)
     mock_hook = mocker.patch('airflow_extensions.operators.mart_operator.ExasolHook')
     mock_conn = mock_hook().get_conn().__enter__()
@@ -370,7 +376,9 @@ def test_execute__mock_stage_callables__stages_called_with_correct_context_and_o
         )
         for stage, substages in operator.stages
     ]
-    operator.execute({'data_interval_start': pendulum.DateTime(2020, 1, 1), 'debug': False})
+    operator.execute(
+        {'data_interval_start': pendulum.DateTime(2020, 1, 1), 'debug': False, 'params': {'discreteness': 60}}
+    )
 
     substages_spy.assert_has_calls(
         [
@@ -390,11 +398,20 @@ def test_execute__mock_connection__correct_sql_executed_in_order(mocker: MockerF
         {%- block drop_temp -%} hello from drop_temp {{ schema }}.{{ table }} {%- endblock -%}
     '''
     min_date = pendulum.DateTime(2020, 1, 1)
-    operator = operator_factory(mocker, MartMethod.MERGE, template=template, min_date=min_date, report_dt_column='test')
+    operator = operator_factory(
+        mocker,
+        MartMethod.MERGE,
+        template=template,
+        min_date=min_date,
+        report_dt_column='test',
+        params={'discreteness': 60},
+    )
     mocker.patch('airflow_extensions.operators.mart_operator.exasol.is_table_empty', return_value=True)
     mock_hook = mocker.patch('airflow_extensions.operators.mart_operator.ExasolHook')
 
-    operator.execute({'data_interval_start': pendulum.DateTime(2020, 1, 1), 'debug': False})
+    operator.execute(
+        {'data_interval_start': pendulum.DateTime(2020, 1, 1), 'debug': False, 'params': {'discreteness': 60}}
+    )
 
     mock_conn = mock_hook().get_conn().__enter__()
     mock_conn.assert_has_calls(
