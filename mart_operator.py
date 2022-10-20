@@ -1,3 +1,4 @@
+import datetime
 import logging
 from datetime import timedelta
 from enum import Enum
@@ -19,6 +20,9 @@ from jinja2 import meta
 
 
 class MartMethod(str, Enum):
+    """
+    Class with allowable method
+    """
     MERGE = 'merge'
     INCREMENT = 'increment'
     REPLACE = 'replace'
@@ -26,6 +30,9 @@ class MartMethod(str, Enum):
 
 
 class Stage(str, Enum):
+    """
+    Class with allowable stage
+    """
     CREATE_TEMP = 'create_temp'
     TRUNCATE_TARGET = 'truncate_target'
     INSERT_TEMP_TO_TARGET = 'insert_temp_to_target'
@@ -36,6 +43,9 @@ class Stage(str, Enum):
 
 # pylint: disable=no-member
 class MartConfig(pydantic.BaseModel):
+    """
+    Class mart config
+    """
     exa_schema: str = pydantic.Field(alias='schema')
     table: str
     method: MartMethod
@@ -57,13 +67,16 @@ class MartConfig(pydantic.BaseModel):
 
 # pylint: disable=no-member
 class StageContext(pydantic.BaseModel):
+    """
+    Class with stage context
+    """
     _template: jinja2.Template = pydantic.PrivateAttr()
     _tmp_tables: Dict[str, str] = pydantic.PrivateAttr()
 
     exa_schema: str = pydantic.Field(alias='schema')
     table: str
-    lower_bound: pendulum.Date
-    upper_bound: pendulum.Date
+    lower_bound: pendulum.DateTime
+    upper_bound: pendulum.DateTime
     is_initial: bool
     report_dt_column: Optional[str]
     debug: bool
@@ -119,6 +132,9 @@ PreparedStage = Tuple[Optional[str], SubstageCallable]
 
 
 def truncate_target(conn: ExaConnectionExt, context: StageContext):
+    """
+    Method for truncate target table
+    """
     temp_schema, temp_table = context.tmp_final.split('.')
 
     if exasol.is_table_empty(conn, temp_schema, temp_table):
@@ -130,6 +146,9 @@ def truncate_target(conn: ExaConnectionExt, context: StageContext):
 
 
 def insert_temp_to_target(conn: ExaConnectionExt, context: StageContext):
+    """
+    Method for insert data from temp table to target table
+    """
     sys_columns = {
         'PROCESSED_DTTM',
     }
@@ -153,6 +172,13 @@ def insert_temp_to_target(conn: ExaConnectionExt, context: StageContext):
 
 
 def drop_temp(conn: ExaConnectionExt, context: StageContext):
+    """
+    Method for drop temp table
+
+    Args:
+        conn - connection
+        context
+    """
     if context.debug:
         logging.info(f'Debug is ON, tmp tables {context.tmp_tables} not dropped.')
         return
@@ -161,10 +187,29 @@ def drop_temp(conn: ExaConnectionExt, context: StageContext):
         conn.execute(f'drop table if exists {tmp};').close()
 
 
+def skipper(task_date: datetime.date, dag_date: pendulum.DateTime):
+    """
+    Method for skipping tasks by boolean date comparison condition
+
+    Args:
+        task_date - date task run
+        dag_date  - date dag run
+    """
+    if isinstance(task_date, datetime.date):
+        task_date = datetime.datetime(task_date.year, task_date.month, task_date.day).replace(tzinfo=LOCAL_TZ)
+    if task_date <= dag_date:
+        return True
+    return False
+
+
 def delete_increment_target(conn: ExaConnectionExt, context: StageContext):
     """
-    Удаляет инкрементальный период из целевой таблицы по колонке report_dt_column за интервал:
+    Removes an incremental period from the target table by column report_dt_column per interval:
     [max(target_interval_lower_bound, increment_min_dt), target_interval_upper_bound)
+
+    Args:
+        conn - connection
+        context
     """
     temp_schema, temp_table = context.tmp_final.split('.')
 
@@ -174,39 +219,22 @@ def delete_increment_target(conn: ExaConnectionExt, context: StageContext):
         TelegramWarningSender(warning_message).send(message)
         return
 
-    increment_min_dt_raw = exasol.get_column_min(conn, temp_schema, temp_table, context.report_dt_column)
-    if increment_min_dt_raw is None:
-        lower_bound = context.lower_bound
-    else:
-        increment_min_dt = pendulum.parse(increment_min_dt_raw)
-        if isinstance(increment_min_dt, pendulum.DateTime):
-            increment_min_dt = increment_min_dt.date()
-
-        lower_bound = max(increment_min_dt, context.lower_bound)
-        if increment_min_dt > context.lower_bound:
-            warning_message = SimpleMessage()
-            message = (
-                f'<!subteam^SSQU5UUDV> при расчете витрины {context.target} минимальная дата в'
-                f'TMP таблице больше нижней границы инкремента.'
-            )
-            TelegramWarningSender(warning_message).send(message)
-
     conn.execute(
         f'delete from {context.target}'
-        f' where {context.report_dt_column} >= \'{lower_bound.to_date_string()}\''
-        f' and {context.report_dt_column} < \'{context.upper_bound.to_date_string()}\';'
+        f' where {context.report_dt_column} >= \'{context.lower_bound}\''
+        f' and {context.report_dt_column} < \'{context.upper_bound}\';'
     ).close()
 
 
 class MartOperator(DWHBaseTaskOperator):
     """
-    Оператор для сбора витрин. Поддерживает методы, описанные в method_stages.
-    Методы разбиты на последовательные стадии - Stage - для которых можно реализовать
-    дефолтное поведение (default_stages).
-    При инициализации оператор загружает шаблон и, согласно методу в конфиге,
-    разбивает его на стадии, используя в случае необходимости дефолтное поведение
-    для стадий (если в шаблоне этап отсутствует).
-    Определение стадий осуществляется на основе имен блоков в шаблоне.
+    Display case operator. Supports the methods described in method_stages.
+    Methods are divided into successive stages - Stage - for which you can implement
+    default behavior (default_stages).
+    During initialization, the operator loads the template and, according to the method in the config,
+    breaks it into stages, using the default behavior if necessary
+    for stages (if there is no stage in the template).
+    The stages are defined based on the block names in the template.
     """
 
     method_stages = {
@@ -260,6 +288,8 @@ class MartOperator(DWHBaseTaskOperator):
         if len(self.tmp_tables) > 1 and self.final_tmp_table not in self.tmp_tables:
             raise DWHError(f'{template_name}: missing "{self.final_tmp_table}" temporary table')
 
+        self.bound_start_of = 60
+
     def __deepcopy__(self, *args, **kwargs):
         """
         FIXME DWH-2259
@@ -274,10 +304,13 @@ class MartOperator(DWHBaseTaskOperator):
 
     def prepare_stages(self, template_name: str) -> List[Tuple[Stage, List[PreparedStage]]]:
         """
-        Собирает из шаблона и default_stages функции, которые будут вызваны в execute
+        Collects functions from the template and default_stages that will be called in execute
 
-        :param template_name: наименование файла конфига для сообщений об ошибках
-        :return: подготовленные к запуску стадии
+        Args:
+         template_name - config file name for error messages
+
+        Return:
+            stages prepared for launch
         """
         parsed_substages = [
             self.template_block_to_substage(template_name, block_name.lower(), block)
@@ -307,10 +340,13 @@ class MartOperator(DWHBaseTaskOperator):
         self, template_name: str, block_name: str, block: Callable
     ) -> Tuple[Stage, Optional[str], SubstageCallable]:
         """
-        :param template_name: имя шаблона для вывода ошибок
-        :param block_name: имя блока из шаблона
-        :param block: jinja блок
-        :return: описание подстадии в кортеже
+        Args:
+            template_name - имя шаблона для вывода ошибок
+            block_name - имя блока из шаблона
+            block - jinja блок
+
+        Return:
+            Substage description in tuple
         """
         allowed_stages = self.method_stages[self.config.method]
         allowed_stage_names = '/'.join(allowed_stages)
@@ -339,12 +375,16 @@ class MartOperator(DWHBaseTaskOperator):
     @staticmethod
     def block_runner_factory(template_name: str, block_name: str, block: Callable):
         """
-        :param template_name: имя шаблона для логирования
-        :param block_name: имя блока
-        :param block: jinja блок
-        :return: функция, выполняющая sql блок из шаблона в exasol
-        """
+        Method that executes a sql block from a template in exasol
 
+        Args:
+            template_name: имя шаблона для логирования
+            block_name: имя блока
+            block: jinja блок
+
+        Return:
+            function that executes a sql block from a template in exasol
+        """
         def block_runner(conn: ExaConnectionExt, context: StageContext):
             sql = ''.join(block(context.jinja_context))
             if sql.strip():
@@ -356,6 +396,14 @@ class MartOperator(DWHBaseTaskOperator):
 
     @staticmethod
     def get_template_variables(jinja_env: jinja2.Environment, template_name: str) -> Set[str]:
+        """
+        Method for getting variable from jinja template
+        Args:
+             jinja_env - jinja environment
+             template_name - name jinja template
+        Return:
+            List variable
+        """
         raw_template = jinja_env.loader.get_source(jinja_env, template_name)
         template_ast = jinja_env.parse(raw_template)
         return meta.find_undeclared_variables(template_ast)
@@ -363,50 +411,88 @@ class MartOperator(DWHBaseTaskOperator):
     def execute(self, context: Any):
         hook = ExasolHook(exasol_conn_id=self.exasol_conn_id)
         data_interval_start: pendulum.DateTime = context['data_interval_start'].in_tz(LOCAL_TZ)
-
+        self.log.info(context)
+        # pylint: disable=C0207
+        bound_start_of = int(str(context.get('dag', '-60>')).split('-')[-1][:-1])
         with hook.get_conn() as conn:
             is_initial = exasol.is_table_empty(conn, self.config.exa_schema, self.config.table)
-            lower_bound, upper_bound = self.get_date_bounds(conn, is_initial, data_interval_start.date())
-            context = StageContext(
-                self.template,
-                self.tmp_tables,
-                schema=self.config.exa_schema,
-                table=self.config.table,
-                lower_bound=lower_bound,
-                upper_bound=upper_bound,
-                is_initial=is_initial,
-                report_dt_column=self.config.report_dt_column,
-                debug=context.get('debug', False),
-            )
+            lower_bound, upper_bound = self.get_date_bounds(conn, is_initial, data_interval_start, bound_start_of)
+            self.log.info(context)
+            lower_bound = lower_bound.to_datetime_string()
+            upper_bound = upper_bound.to_datetime_string()
+            self.log.info(f'{lower_bound}, {upper_bound}')
+            if skipper(self.config.min_date, data_interval_start):
+                context = StageContext(
+                    self.template,
+                    self.tmp_tables,
+                    schema=self.config.exa_schema,
+                    table=self.config.table,
+                    lower_bound=lower_bound,
+                    upper_bound=upper_bound,
+                    is_initial=is_initial,
+                    report_dt_column=self.config.report_dt_column,
+                    debug=context.get('debug', False),
+                )
 
-            conn.commit()
-            for stage, substages in self.stages:
-                logging.info(f'Running stage {stage.name.lower()}')
-                for substage_name, substage_callable in substages:
-                    if substage_name is not None:
-                        logging.info(f'Running substage {substage_name}')
+                conn.commit()
+                for stage, substages in self.stages:
+                    logging.info(f'Running stage {stage.name.lower()}')
+                    for substage_name, substage_callable in substages:
+                        if substage_name is not None:
+                            logging.info(f'Running substage {substage_name}')
 
-                    substage_callable(conn, context)
-                    if stage in self.commit_after:
-                        conn.commit()
-            conn.commit()
-
-    def get_date_bounds(
-        self, conn: ExaConnectionExt, is_initial: bool, data_interval_start: pendulum.Date
-    ) -> Tuple[pendulum.Date, pendulum.Date]:
-        if is_initial:
-            lower_bound: pendulum.Date = self.config.min_date
-        else:
-            max_table_date = self.get_max_dt_column_date(conn)
-            interval_start = data_interval_start - self.config.lag
-            if max_table_date is not None:
-                lower_bound = min(interval_start, max_table_date)
+                        substage_callable(conn, context)
+                        if stage in self.commit_after:
+                            conn.commit()
+                conn.commit()
             else:
-                lower_bound = interval_start
+                self.log.info("Task run skipped because task run dttm earlier than minimum report dttm for this mart.")
 
-        return lower_bound.start_of(self.config.lower_bound_start_of), data_interval_start + timedelta(days=1)
+    # pylint: disable=W0613
+    def get_date_bounds(
+        self, conn: ExaConnectionExt, is_initial: bool, data_interval_start: pendulum.DateTime, bound_start_of: int
+    ) -> Tuple[pendulum.DateTime, pendulum.DateTime]:
+        """
+        Method for determining the upper and lower bounds of dates
+        Args:
+              conn - connection to exasol
+              is_initial - boolean sign of an empty table
+              data_interval_start - date interval start
+        Return:
+            Upper and lower bounds of dates
+        """
+        if is_initial:
+            lower_bound: pendulum.DateTime = pendulum.DateTime(
+                self.config.min_date.year, self.config.min_date.month, self.config.min_date.day
+            )
+        else:
+            lower_bound = data_interval_start - self.config.lag
+        if bound_start_of == 1440:
+            lower_bound = lower_bound.start_of(self.config.lower_bound_start_of)
+            upper_bounds = (data_interval_start + timedelta(minutes=bound_start_of)).start_of(
+                self.config.lower_bound_start_of
+            )
+        elif bound_start_of == 60:
+            if isinstance(lower_bound, pendulum.DateTime):
+                lower_bound = pendulum.DateTime(lower_bound.year, lower_bound.month, lower_bound.day, lower_bound.hour)
+            else:
+                lower_bound = pendulum.DateTime(lower_bound.year, lower_bound.month, lower_bound.day)
+            upper_bounds = pendulum.DateTime(
+                data_interval_start.year, data_interval_start.month, data_interval_start.day, data_interval_start.hour
+            ) + timedelta(minutes=bound_start_of)
+
+        return lower_bound, upper_bounds
 
     def get_max_dt_column_date(self, conn: ExaConnectionExt) -> Optional[pendulum.Date]:
+        """
+        Method for determining the maximum date in the target column
+
+        Args:
+            conn - connection to exasol
+
+        Returns:
+            max date
+        """
         if not self.config.report_dt_column:
             return None
 
