@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import requests
+from airflow.exceptions import AirflowSkipException
 from airflow.models import BaseOperator, Connection
 from airflow_extensions.constants import CLICKHOUSE_SCRAT_CONN_ID, LOCAL_TZ
 from airflow_extensions.hooks.clickhouse_hook import ClickhouseHook
@@ -29,7 +30,6 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
         self._table = config['name']
         self.base_url = config['base_url']
         self.counter = 0
-        self.status = config.get('status', '')
         self._organization_id = config['organization_id']
         self._method = config['method']['name']
         self._append_field = config['method'].get('field')
@@ -40,7 +40,7 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
 
     def pre_execute(self, context: Any):
         self._ch_hook = ClickhouseHook(conn_id=CLICKHOUSE_SCRAT_CONN_ID)
-        self.token_api = Connection.get_connection_from_secrets('parcomatica').password
+        self.token_api = Connection.get_connection_from_secrets('parkomatica').password
 
     # pylint: disable=R0912, R0915, R0914
     def execute(self, context: Any):
@@ -53,32 +53,33 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
 
         # Load data for parking-session
         if self.config['add_url'] == 'parking-session':
-            if self._method in ('initial', 'append'):
+            if self._method in ('replace', 'custom'):
                 self.log.info("Start load data from API")
-                self.load_parking_session(start_tm, end_tm)
-                if self._method == 'append':
+                self.load_parking_session(start_tm, end_tm, 'closed')
+                self.load_parking_session(start_tm, end_tm, 'in_progress')
+                self.load_parking_session(start_tm, end_tm, 'new')
+                if self._method == 'custom':
                     # Get a list of id records of open parking sessions
-                    self.log.info("Load open parking session from CH")
-                    arr_open_ses = self._ch_hook.get_records(
-                        f"select distinct id from {self._database}.{self._table} where finishedAt = 0"
+                    self.log.info("Delete open and new parking session from CH")
+                    self._ch_hook.run(
+                        f"alter table {self._database}._{self._table} on cluster cluster "
+                        f"delete where status in ('in_progress','new')"
                     )
-                    self.log.info(f"Found {len(arr_open_ses)} open sessions.")
-                    if arr_open_ses:
-                        for session_id in arr_open_ses:
-                            # Generate a link for a request by record id
-                            self.url4requests = urljoin(self.base_url, f"{self.config['add_url']}/{str(session_id[0])}")
-                            data = self._response_data_parcomatica()[0]
-                            self.arr4load += data
+                    clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
+                    self._delete_if_exist()
+                else:
+                    clickhouse.truncate(self._ch_hook, self._database, f"_{self._table}")
+                    clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
             else:
                 raise Exception(f"For parking-session support 'initial' or 'update' load method. Not {self._method}")
 
         # Load data for parking-session
         elif self.config['add_url'] == 'zone/get-list':
-            if self._method in ('initial', 'replace'):
+            if self._method == 'replace':
                 self.log.info("Getting a list of zones from CH")
                 zone_list = self._ch_hook.fetch(
                     "select distinct JSONExtractString(zone, 'number') as zone_number "
-                    "from {self._database}.{self._table}"
+                    "from snp_parkomatica.parking_session"
                 )
                 self.log.info("Start load data from API")
                 data_zone_arr = []
@@ -96,10 +97,10 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
 
         # Load data for organization
         elif self.config['add_url'] == 'organization':
-            if self._method in ('initial', 'update'):
+            if self._method == 'custom':
                 self.log.info("Getting a list of organization from CH")
                 org_list = self._ch_hook.fetch(
-                    "select distinct JSONExtractString(organization, 'id') from {self._database}.{self._table};"
+                    "select distinct JSONExtractString(organization, 'id') as org from snp_parkomatica.parking_session"
                 )
                 self.log.info("Start load data from API")
                 data_org_arr = []
@@ -109,8 +110,11 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
                 self.arr4load = [data_dict for data_list in data_org_arr for data_dict in data_list]
                 del data_org_arr
                 gc.collect()
-                if self._method == 'initial':
+                if self._method == 'replace':
                     clickhouse.truncate(self._ch_hook, self._database, f"_{self._table}")
+                    clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
+                else:
+                    self._delete_if_exist()
             else:
                 raise Exception(f"For organization support 'initial' or 'update' load method. Not {self._method}")
 
@@ -120,6 +124,7 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
                 self.log.info("Start load data from API")
                 self.load_car()
                 clickhouse.truncate(self._ch_hook, self._database, f"_{self._table}")
+                clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
             else:
                 raise Exception(f"For car support 'replace' load method. Not {self._method}")
 
@@ -129,20 +134,15 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
                 self.log.info("Start load data from API")
                 self.arr4load = self._response_data_parcomatica()[0]
                 clickhouse.truncate(self._ch_hook, self._database, f"_{self._table}")
+                clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
             else:
                 raise Exception(f"For user support 'replace' load method. Not {self._method}")
 
-        self.log.info("Delete (if exists) records loaded in the current iteration from the database")
-        # pylint: disable=W1401
-        arr4delete = [re.findall('"id":\s{0,1}(\d+)', x)[0] for x in self.arr4load]
-        self._ch_hook.run(
-            f"alter table {self._database}._{self._table} on cluster cluster "
-            f"delete where id in ({', '.join(arr4delete)})"
-        )
-        clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
-
-        self.log.info(f"Insert data to CH. Will load {len(arr4delete)} records")
-        self._insert_json_arr_ch(self.arr4load)
+        if len() == 0:
+            raise AirflowSkipException(f"No new data to load")
+        else:
+            self.log.info(f"Insert data to CH. Will load {len(self.arr4load)} records")
+            self._insert_json_arr_ch(self.arr4load)
 
     def load_organization(self, org: str) -> list:
         """
@@ -183,7 +183,7 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
         data_arr = self._response_data_parcomatica(params)[0]
         return data_arr
 
-    def load_parking_session(self, start_tm: int, end_tm: int):
+    def load_parking_session(self, start_tm: int, end_tm: int, status: str):
         """
         Method for loading data on parking sessions.
         When the method is executed, the variable self.arr4load is filled with data
@@ -194,20 +194,36 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
         """
         counter = 0
         page_number = 1
-        params = {'from': start_tm, 'to': end_tm, 'page': counter}
-        if self.status == 'in_progress':
+        params = {'from': start_tm, 'to': end_tm, 'page': counter, 'status': status}
+        if status in ('in_progress', 'new'):
             params.pop('from')
             params.pop('to')
-            params['status'] = self.status
         while counter <= page_number - 1:
             data_arr, page_number = self._response_data_parcomatica(params)
-            counter += 1
-            params.update({'page': counter})
-            self.arr4load += data_arr
-            time.sleep(0.3)
+            if data_arr:
+                counter += 1
+                params.update({'page': counter})
+                self.arr4load += data_arr
+                time.sleep(0.3)
+            else:
+                return
+
+    def _delete_if_exist(self):
+        """
+        Method for deleting records by ID from the database before loading new data
+        """
+        self.log.info("Delete (if exists) records loaded in the current iteration from the database")
+        # pylint: disable=W1401
+        arr4delete = [re.findall('"id":\s*(\d+)', x)[0] for x in self.arr4load if re.findall('"id":\s*(\d+)', x)]
+        if arr4delete:
+            self._ch_hook.run(
+                f"alter table {self._database}._{self._table} on cluster cluster "
+                f"delete where id in ({', '.join(arr4delete)})"
+            )
+            clickhouse.wait_for_mutations(self._ch_hook, self._database, f"_{self._table}")
 
     # pylint: disable=W0102
-    def _response_data_parcomatica(self, params={}) -> tuple[list, int]:
+    def _response_data_parcomatica(self, params={}):
         """
         Method for processing response from API
         Return:
@@ -230,6 +246,10 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
                         if json.loads(data).get('meta'):
                             data_meta = json.loads(data).get('meta')
                             page_cnt = data_meta['pageCount']
+                            if data_meta['totalCount'] != 0:
+                                self.log.info(f"Total records from period: {data_meta['totalCount']}")
+                            else:
+                                return [], 0
 
                     elif isinstance(json.loads(data), list):
                         data_arr = json.loads(data)
@@ -273,15 +293,13 @@ class ParkomaticaDataLoaderToCH(BaseOperator):
         Args:
             result_json_arr - list of json
         """
-        for batct_number in range(len(result_json_arr) // self.insert_limit + 1):
-            batch4load = result_json_arr[batct_number * self.insert_limit : (batct_number + 1) * self.insert_limit]
+        for batch_number in range(len(result_json_arr) // self.insert_limit + 1):
+            batch4load = result_json_arr[batch_number * self.insert_limit : (batch_number + 1) * self.insert_limit]
             self.log.info(f"Loading will be done in {len(result_json_arr) // self.insert_limit + 1} iterations")
             if batch4load:
-                self.log.info(f"Insert batch {batct_number + 1} iterations")
-                sql_import = f"""
-                                INSERT INTO {self._database}.{self._table} FORMAT JSONEachRow {'  '.join(batch4load)};
-                                """
-                self._ch_hook.run(sql_import)
+                self.log.info(f"Insert batch {batch_number + 1} iterations")
+                data = '\n'.join(batch4load)
+                self._ch_hook.import_data(f"{self._database}.{self._table}", data, data_format='JSONEachRow')
                 clickhouse.wait_replication(self._ch_hook, self._database, self._table)
 
     @staticmethod
